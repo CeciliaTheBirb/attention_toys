@@ -12,8 +12,8 @@ import torch.nn.functional as F
 #from ..base.iSeg import iSeg
 #from ..base.utils import generate_distinct_colors
 from featurecluster import DFC_KL
-from util.cam import cam_to_label
-from util.miou import format_tabs, ShowSegmentResult
+from util_iseg.cam import cam_to_label
+from util_iseg.miou import format_tabs, ShowSegmentResult
 
 warnings.filterwarnings("ignore")
 
@@ -25,7 +25,7 @@ import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 
-from stable_difusion import StableDiffusion
+from stable_diffusion import StableDiffusion
 
 warnings.filterwarnings("ignore")
 
