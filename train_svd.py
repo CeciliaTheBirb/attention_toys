@@ -743,13 +743,13 @@ def main(args):
                     optim_params_1d.append(p)
                 else:
                     optim_params.append(p)
-                    
-    unet_for_mask = UNet2DConditionModel.from_pretrained("stabilityai/stable-diffusion-2-1-base", subfolder="unet", revision=args.revision, low_cpu_mem_usage=True)
-    noise_scheduler_mask = DDPMScheduler.from_pretrained("stabilityai/stable-diffusion-2-1-base", subfolder="scheduler")
-    for p in unet_for_mask.parameters():
-        p.requires_grad = False
-    unet_for_mask.requires_grad_(False)
-    unet_for_mask.eval()
+    if not args.use_sam_mask:
+        unet_for_mask = UNet2DConditionModel.from_pretrained("stabilityai/stable-diffusion-2-1-base", subfolder="unet", revision=args.revision, low_cpu_mem_usage=True)
+        noise_scheduler_mask = DDPMScheduler.from_pretrained("stabilityai/stable-diffusion-2-1-base", subfolder="scheduler")
+        for p in unet_for_mask.parameters():
+            p.requires_grad = False
+        unet_for_mask.requires_grad_(False)
+        unet_for_mask.eval()
     
     total_params = sum(p.numel() for p in optim_params)
     print(f"Number of Trainable Parameters: {total_params * 1.e-6:.2f} M")
@@ -977,8 +977,9 @@ def main(args):
                 # Convert images to latent space
                 latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
+                
                 if args.use_sam_mask:
-                    dog_masks_latent=torch.zeros((b,1,latents.shape[-2],latents.shape[-1]),device=latents.device)
+                    model_pred=torch.zeros((b,1,latents.shape[-2],latents.shape[-1]),device=latents.device)
                     for i in range(b):
                         # First use YOLO to detect the target subject in the image with a bounding box
                         img_tensor = pixel_img[i].detach().cpu()  # (3, H, W) in [-1,1]
@@ -1005,46 +1006,40 @@ def main(args):
                             print("no subject detected!")
                             mask_np = np.ones((H, W), dtype=np.uint8)
                         else:
-                            # Pick the first/top‐scoring box:
-                            raw_xyxy = detections.xyxy[0]   # could be shape (6,) or (N, 6)
+                            raw_xyxy = detections.xyxy[0]
 
-                            # 1) Convert to a NumPy array explicitly (if it’s a Torch Tensor):
                             if isinstance(raw_xyxy, torch.Tensor):
                                 raw_xyxy = raw_xyxy.cpu().numpy()
-
-                            # 2) Ensure it’s 2-D: if it’s 1-D (shape (6,)), turn it into shape (1, 6)
                             xyxy = np.asarray(raw_xyxy)
                             if xyxy.ndim == 1:
-                                # single detection → reshape to (1, 6)
                                 xyxy = xyxy[np.newaxis, :]
 
-                            first_box = xyxy[0, :4].astype(np.float32)  # shape (4,)
-                            
-                            # Now run sam on the box to get the exact mask:
+                            first_box = xyxy[0, :4].astype(np.float32)  
                             sam.predictor.set_image(img_np)
 
                             with torch.no_grad():
                                 masks, _, _ = sam.predictor.predict(
                                     point_coords=None,
                                     point_labels=None,
-                                    box=first_box,         # should be (1,4)
+                                    box=first_box,         
                                     multimask_output=False
                                 )
-                            mask_np = masks[0].astype(np.uint8)  # (H, W)
+                            mask_np = masks[0].astype(np.uint8) 
                         
                         Image.fromarray(mask_np * 255).save(f"seg_mask_{i}.png")
-                        # ─────── Step E: Convert to tensor & downsample to latent resolution ───────
                         mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).float()  # (1,1,H,W)
                         mask_latent = F.interpolate(
                             mask_tensor,
-                            size=(latents.shape[-2], latents.shape[-1]),  # e.g. (64, 64)
+                            size=(latents.shape[-2], latents.shape[-1]), 
                             mode="nearest"
-                        )  # → shape (1, 1, H_latent, W_latent)
-                        dog_masks_latent[i] = mask_latent.to(accelerator.device)
+                        ) 
+                        model_pred[i] = mask_latent.to(accelerator.device)
 
                 else:
                     # Use iSeg to get the mask
+                    # we must get mask from the frozen unet_for_mask, not the main unet that updates with lora weights, or else the attention maps obtained will be distorted
                     encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                    iseg_config = get_iseg_config()
                     with torch.no_grad():
                         mask_gt, _ = infer_mask_helper(latents.detach().clone(), encoder_hidden_states.detach().clone(), iseg_config, unet_for_mask, noise_scheduler_mask, t=False)
                     #mask_np, difference = infer_mask_helper(latents, encoder_hidden_states, iseg_config, unet, noise_scheduler, t=True)
@@ -1063,81 +1058,19 @@ def main(args):
                             size=(latents.shape[-2], latents.shape[-1]),  # e.g. (64, 64)
                             mode="nearest"
                         ) 
-                    #mask_np = mask_latent.to(accelerator.device)
-                    #print(f'mask max: {mask_np.max()}, mask min: {mask_np.min()}, 90: {torch.quantile(mask_np, 0.9).item():.4f}')
-                    noise = torch.randn_like(latents)
-                    bsz = latents.shape[0]
-                    # Sample a random timestep for each image
-                    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                    timesteps = timesteps.long()
 
-                    # Add noise to the latents according to the noise magnitude at each timestep
-                    # (this is the forward diffusion process)
-                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                    # Get the text embedding for conditioning
-                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-
-                    # Predict the noise residual
-                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                    diff = (model_pred - noise).pow(2)     
-                    # Create a new tensor instead of modifying diff in-place
-                    masked_diff = diff * mask_gt#.clone()
-                    loss = masked_diff.sum() / (mask_gt.sum()*model_pred.shape[1]  + 1e-8) #+ (mask_gt.to(latents.device, latents.dtype)-mask_np).pow(2).mean()*0.1
-
-                # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
-                # Sample a random timestep for each image
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
                 timesteps = timesteps.long()
 
                 # Add noise to the latents according to the noise magnitude at each timestep
                 # (this is the forward diffusion process)
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-                '''
-                # Get the text embedding for conditioning
-                encoder_hidden_states = text_encoder(batch["input_ids"])[0]
-                with torch.no_grad():
-                    mask_gt, _ = infer_mask_helper(latents.detach().clone(), encoder_hidden_states.detach().clone(), iseg_config, unet_for_mask, noise_scheduler_mask, t=False)
-                #mask_np, difference = infer_mask_helper(latents, encoder_hidden_states, iseg_config, unet, noise_scheduler, t=True)
-                mask_gt = mask_gt.to(latents.device, dtype=latents.dtype)
-                # Predict the noise residual
-                #model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                #mask_np = mask_np.unsqueeze(0).unsqueeze(0) #torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).float()  # (1,1,H,W)
-                mask_gt = mask_gt.unsqueeze(0).unsqueeze(0)
-                #mask_np = F.interpolate(
-                        #mask_np,
-                        #size=(latents.shape[-2], latents.shape[-1]),  # e.g. (64, 64)
-                        #mode="nearest"
-                    #)  # → shape (1, 1, H_latent, W_latent)
-                mask_gt = F.interpolate(
-                        mask_gt,
-                        size=(latents.shape[-2], latents.shape[-1]),  # e.g. (64, 64)
-                        mode="nearest"
-                    ) 
-                #mask_np = mask_latent.to(accelerator.device)
-                #print(f'mask max: {mask_np.max()}, mask min: {mask_np.min()}, 90: {torch.quantile(mask_np, 0.9).item():.4f}')
-                noise = torch.randn_like(latents)
-                bsz = latents.shape[0]
-                # Sample a random timestep for each image
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
-                timesteps = timesteps.long()
-
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-
-                # Get the text embedding for conditioning
                 encoder_hidden_states = text_encoder(batch["input_ids"])[0]
 
-                # Predict the noise residual
                 model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
-                diff = (model_pred - noise).pow(2)     
-                # Create a new tensor instead of modifying diff in-place
-                masked_diff = diff * mask_gt#.clone()
-                loss = masked_diff.sum() / (mask_gt.sum()*model_pred.shape[1]  + 1e-8) #+ (mask_gt.to(latents.device, latents.dtype)-mask_np).pow(2).mean()*0.1
-                '''# Get the target for loss depending on the prediction type
+
                 if noise_scheduler.config.prediction_type == "epsilon":
                     target = noise
                 elif noise_scheduler.config.prediction_type == "v_prediction":
@@ -1149,7 +1082,7 @@ def main(args):
                     # Split instance & prior halves
                     model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
                     target, target_prior       = torch.chunk(target, 2, dim=0)
-                    mask_inst, mask_prior      = torch.chunk(dog_masks_latent, 2, dim=0)
+                    mask_inst, mask_prior      = torch.chunk(mask_gt, 2, dim=0)
 
                     # Instance loss (foreground-only)
                     diff_inst = (model_pred - target).pow(2)             # (B, C, 64,64)
@@ -1164,8 +1097,8 @@ def main(args):
                     loss = loss_inst + args.prior_loss_weight * loss_prior
                 else:
                     diff = (model_pred - target).pow(2)        # (B, C, 64,64)
-                    masked = diff * dog_masks_latent                  # (B, C, 64,64)
-                    loss = masked.sum() / (dog_masks_latent.sum() * model_pred.shape[1] + 1e-8)
+                    masked = diff * mask_gt                 # (B, C, 64,64)
+                    loss = masked.sum() / (mask_gt.sum() * model_pred.shape[1] + 1e-8)
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:

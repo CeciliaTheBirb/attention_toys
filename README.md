@@ -17,8 +17,9 @@ I tackle two key problems:
 
 **Key features:**
 - Plug-and-play with Stable Diffusion pipelines.
-- Improves generation consistency and precision.
+- Can choose between YOLO+SAM masks or refined attention masks (adapted from *iSeg*) for training.
 - Designed to prevent background content from contaminating subject embeddings.
+![Example1](imgs/assets/cat_example.png)
 
 ### `train.py` – Multi-Subject Extraction from a Single Image
 - Identifies and separates multiple subjects in a single image given user defined targets.
@@ -26,8 +27,9 @@ I tackle two key problems:
 
 **Key features:**
 - Supports simultaneous token learning for multiple subjects.
-- Produces clean, distinct attention maps for each concept.
-- Optimized for compositional synthesis in downstream tasks.
+- Better results than *ConceptExpress* (automatic extraction of subject lack semantic guidance and cannot provide clean separations).
+![Example2](imgs/assets/farm_example.png)
+
 
 ---
 
@@ -56,7 +58,9 @@ I tackle two key problems:
         --lr_scheduler="constant" \
         --lr_warmup_steps=0 \
         --num_class_images=200 \
-        --max_train_steps=500
+        --max_train_steps=500 \
+        --use_sam_mask \
+        --subject_name="dog"
      ```
    - For multi-subject concept extraction from a single image:  
      ```bash
