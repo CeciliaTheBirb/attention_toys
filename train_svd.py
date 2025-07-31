@@ -47,7 +47,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 if is_wandb_available():
     import wandb
-from util.config import get_iseg_config
+from util_iseg.config import get_iseg_config
 
 logger = get_logger(__name__)
 
@@ -368,6 +368,16 @@ def parse_args(input_args=None):
         action="store_true",
         help="Whether to train spectral shifts of the text encoder. If set, the text encoder should be float32 precision.",
     )
+    parser.add_argument(
+        "--use_sam_mask",
+        action=True,
+        help="Whether to use a sam mask or a iSeg (attention-based segmentation method) to obtain subject mask.",
+    )
+    parser.add_argument(
+        "--subject_name",
+        action='dog',
+        help="Subject name to detect using YOLO.",
+    )
     if input_args is not None:
         args = parser.parse_args(input_args)
     else:
@@ -562,7 +572,14 @@ def log_validation(text_encoder, tokenizer, unet, vae, args, accelerator, weight
 
 
 def main(args):
-
+    from ultralytics import YOLOWorld
+    yolo = YOLOWorld("yolov8l-world.pt")
+    from segment_anything import sam_model_registry, SamPredictor
+    sam_type       = "vit_h"               
+    sam = sam_model_registry[sam_type](checkpoint="/xuqianxun/sam_vit_h.pth").to(accelerator.device)
+    sam.predictor = SamPredictor(sam)  
+    sam.predictor.model.to(accelerator.device)
+    
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator_project_config = ProjectConfiguration(total_limit=args.checkpoints_total_limit)
@@ -960,36 +977,114 @@ def main(args):
                 # Convert images to latent space
                 latents = vae.encode(batch["pixel_values"].to(dtype=weight_dtype)).latent_dist.sample()
                 latents = latents * vae.config.scaling_factor
-                #dog_masks_latent=torch.zeros((b,1,latents.shape[-2],latents.shape[-1]),device=latents.device)
-                iseg_config = get_iseg_config()
-                
-                '''                for i in range(b):
-                    # ─────── Step A: Convert to uint8 H×W×3 for YOLOWorld ───────
-                    img_tensor = pixel_img[i].detach().cpu()  # (3, H, W) in [-1,1]
-                    # if pixel_images are in [-1,1], bring to [0,255]:
-                    img_np = ((img_tensor + 1) * 127.5).clamp(0, 255).to(torch.uint8).numpy()  # still (3, H, W)
-                    img_np = img_np.transpose(1, 2, 0)  # (H, W, 3), now uint8
-                    iseg_config = get_iseg_config()
-                    with torch.no_grad():
-                        mask_np = infer_mask_helper(img_np, args.instance_prompt, iseg_config)
+                if args.use_sam_mask:
+                    dog_masks_latent=torch.zeros((b,1,latents.shape[-2],latents.shape[-1]),device=latents.device)
+                    for i in range(b):
+                        # First use YOLO to detect the target subject in the image with a bounding box
+                        img_tensor = pixel_img[i].detach().cpu()  # (3, H, W) in [-1,1]
+                        img_np = ((img_tensor + 1) * 127.5).clamp(0, 255).to(torch.uint8).numpy()  # still (3, H, W)
+                        img_np = img_np.transpose(1, 2, 0)  # (H, W, 3), now uint8
+                        yolo.set_classes([args.subject_name])  # set the class to detect
+                        results = yolo.predict(img_np)  # tune confidence as needed
+                        r=results[0]
+                        import supervision as sv
+                        boxes_tensor       = r.boxes.xyxy  # shape: (N, 4), dtype=torch.float32
+                        conf_tensor        = r.boxes.conf  # shape: (N,), dtype=torch.float32
+                        class_tensor       = r.boxes.cls   # shape: (N,), dtype=torch.int64 or torch.int
+                        xyxy       = boxes_tensor.cpu().numpy()       # shape (N,4)
+                        confidences = conf_tensor.cpu().numpy()       # shape (N,)
+                        class_ids   = class_tensor.cpu().numpy().astype(int)  # shape (N,)
+                        detections = sv.Detections(
+                            xyxy=xyxy, 
+                            confidence=confidences, 
+                            class_id=class_ids
+                        )
 
-                        #mask_np = masks[0].astype(np.uint8)  # (H, W)
-                    
-                    # ─────── Step D: Resize `mask_np` → pixel size (H, W), if needed ───────
-                    # (Usually, SAM gives you exactly H×W, but if not, do nearest‐neighbor ↔ same size):
-                    if mask_np.shape != (H, W):
-                        print("not good size!")
-                        #mask_np = cv2.resize(mask_np, (W, H), interpolation=cv2.INTER_NEAREST)
-                    #Image.fromarray(mask_np * 255).save(f"seg_mask_{i}.png")
-                    # ─────── Step E: Convert to tensor & downsample to latent resolution ───────
-                    mask_tensor = mask_np.unsqueeze(0).unsqueeze(0).float()  # (1,1,H,W)
-                    mask_latent = F.interpolate(
-                        mask_tensor,
-                        size=(latents.shape[-2], latents.shape[-1]),  # e.g. (64, 64)
-                        mode="nearest"
-                    )  # → shape (1, 1, H_latent, W_latent)
-                    dog_masks_latent[i] = mask_latent.to(accelerator.device)
-                    
+                        detections = detections.with_nms(threshold=0.5)
+                        if len(detections) == 0:
+                            print("no subject detected!")
+                            mask_np = np.ones((H, W), dtype=np.uint8)
+                        else:
+                            # Pick the first/top‐scoring box:
+                            raw_xyxy = detections.xyxy[0]   # could be shape (6,) or (N, 6)
+
+                            # 1) Convert to a NumPy array explicitly (if it’s a Torch Tensor):
+                            if isinstance(raw_xyxy, torch.Tensor):
+                                raw_xyxy = raw_xyxy.cpu().numpy()
+
+                            # 2) Ensure it’s 2-D: if it’s 1-D (shape (6,)), turn it into shape (1, 6)
+                            xyxy = np.asarray(raw_xyxy)
+                            if xyxy.ndim == 1:
+                                # single detection → reshape to (1, 6)
+                                xyxy = xyxy[np.newaxis, :]
+
+                            first_box = xyxy[0, :4].astype(np.float32)  # shape (4,)
+                            
+                            # Now run sam on the box to get the exact mask:
+                            sam.predictor.set_image(img_np)
+
+                            with torch.no_grad():
+                                masks, _, _ = sam.predictor.predict(
+                                    point_coords=None,
+                                    point_labels=None,
+                                    box=first_box,         # should be (1,4)
+                                    multimask_output=False
+                                )
+                            mask_np = masks[0].astype(np.uint8)  # (H, W)
+                        
+                        Image.fromarray(mask_np * 255).save(f"seg_mask_{i}.png")
+                        # ─────── Step E: Convert to tensor & downsample to latent resolution ───────
+                        mask_tensor = torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).float()  # (1,1,H,W)
+                        mask_latent = F.interpolate(
+                            mask_tensor,
+                            size=(latents.shape[-2], latents.shape[-1]),  # e.g. (64, 64)
+                            mode="nearest"
+                        )  # → shape (1, 1, H_latent, W_latent)
+                        dog_masks_latent[i] = mask_latent.to(accelerator.device)
+
+                else:
+                    # Use iSeg to get the mask
+                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+                    with torch.no_grad():
+                        mask_gt, _ = infer_mask_helper(latents.detach().clone(), encoder_hidden_states.detach().clone(), iseg_config, unet_for_mask, noise_scheduler_mask, t=False)
+                    #mask_np, difference = infer_mask_helper(latents, encoder_hidden_states, iseg_config, unet, noise_scheduler, t=True)
+                    mask_gt = mask_gt.to(latents.device, dtype=latents.dtype)
+                    # Predict the noise residual
+                    #model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                    #mask_np = mask_np.unsqueeze(0).unsqueeze(0) #torch.from_numpy(mask_np).unsqueeze(0).unsqueeze(0).float()  # (1,1,H,W)
+                    mask_gt = mask_gt.unsqueeze(0).unsqueeze(0)
+                    #mask_np = F.interpolate(
+                            #mask_np,
+                            #size=(latents.shape[-2], latents.shape[-1]),  # e.g. (64, 64)
+                            #mode="nearest"
+                        #)  # → shape (1, 1, H_latent, W_latent)
+                    mask_gt = F.interpolate(
+                            mask_gt,
+                            size=(latents.shape[-2], latents.shape[-1]),  # e.g. (64, 64)
+                            mode="nearest"
+                        ) 
+                    #mask_np = mask_latent.to(accelerator.device)
+                    #print(f'mask max: {mask_np.max()}, mask min: {mask_np.min()}, 90: {torch.quantile(mask_np, 0.9).item():.4f}')
+                    noise = torch.randn_like(latents)
+                    bsz = latents.shape[0]
+                    # Sample a random timestep for each image
+                    timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (bsz,), device=latents.device)
+                    timesteps = timesteps.long()
+
+                    # Add noise to the latents according to the noise magnitude at each timestep
+                    # (this is the forward diffusion process)
+                    noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+
+                    # Get the text embedding for conditioning
+                    encoder_hidden_states = text_encoder(batch["input_ids"])[0]
+
+                    # Predict the noise residual
+                    model_pred = unet(noisy_latents, timesteps, encoder_hidden_states).sample
+                    diff = (model_pred - noise).pow(2)     
+                    # Create a new tensor instead of modifying diff in-place
+                    masked_diff = diff * mask_gt#.clone()
+                    loss = masked_diff.sum() / (mask_gt.sum()*model_pred.shape[1]  + 1e-8) #+ (mask_gt.to(latents.device, latents.dtype)-mask_np).pow(2).mean()*0.1
+
                 # Sample noise that we'll add to the latents
                 noise = torch.randn_like(latents)
                 bsz = latents.shape[0]
@@ -1071,7 +1166,7 @@ def main(args):
                     diff = (model_pred - target).pow(2)        # (B, C, 64,64)
                     masked = diff * dog_masks_latent                  # (B, C, 64,64)
                     loss = masked.sum() / (dog_masks_latent.sum() * model_pred.shape[1] + 1e-8)
-'''
+
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
                     params_to_clip = (

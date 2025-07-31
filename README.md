@@ -3,7 +3,7 @@
 This repo provides two applications with refined attention, showcasing the importance of attention map on personalized 2D generation tasks. This work is done as my research skill training for 2D AIGC.
 
 I tackle two key problems:
-1. **Background Leakage in Personalized Generation**  
+1. **Background Leakage in Personalized Subject Learning and Generation**  
 
 2. **Multi-Subject Extraction from a Single Image**  
 
@@ -11,7 +11,7 @@ I tackle two key problems:
 
 ## 📂 Components
 
-### `train_svd.py` – Subject-Only LoRA Training (No Background Leakage)
+### `train_svd.py` – Subject-Only SVDiff Training (No Background Leakage)
 - Fine-tunes SVDiff weights on personalized images.
 - Uses refined attention maps to isolate the subject from the background and only compute loss inside the mask to update weights.
 
